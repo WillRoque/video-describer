@@ -1,0 +1,76 @@
+name: Build and Deploy to Cloud Run
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  PROJECT_ID: video-describer
+  AR_LOCATION: us-east4         # Artifact Registry
+  CR_SERVICE: video-describer   # Cloud Run
+  CR_REGION: us-east4           # Cloud Run
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Test
+        run: |
+          sudo apt install ffmpeg -y # Dependency
+          go test ./...
+          
+  build-deploy:
+
+    # Needed for Gcloud's Workload Identity Federation to authenticate.
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+
+    runs-on: ubuntu-latest
+    needs:
+      - test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          cd cmd/api
+          go build -v .
+
+      - name: Google Auth
+        id: auth
+        uses: 'google-github-actions/auth@v2'
+        with:
+          token_format: access_token
+          project_id: '${{ env.PROJECT_ID }}'
+          workload_identity_provider: '${{ secrets.WIF_PROVIDER }}'
+          service_account: '${{ secrets.SERVICE_ACCOUNT }}'
+
+      - name: Docker Auth
+        id: docker-auth
+        uses: 'docker/login-action@v3'
+        with:
+          username: 'oauth2accesstoken'
+          password: '${{ steps.auth.outputs.access_token }}'
+          registry: '${{ env.AR_LOCATION }}-docker.pkg.dev'
+
+      - name: Build and Push Container Image
+        id: docker-build-push
+        env:
+          IMAGE_TAG: '${{ env.AR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.CR_SERVICE }}/video-describer:${{ github.sha }}'
+        run: |-
+          docker build -t "${IMAGE_TAG}" ./
+          docker push "${IMAGE_TAG}"
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Deploy to Cloud Run
+        id: deploy
+        uses: google-github-actions/deploy-cloudrun@v2.5.0
+        with:
+          service: ${{ env.CR_SERVICE }}
+          region: ${{ env.CR_REGION }}
+          image: ${{ steps.docker-build-push.outputs.image_tag }}
